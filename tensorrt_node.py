@@ -243,7 +243,8 @@ class BlockTensorRTPatch:
     def __init__(self, model, config):
         self.model = model
         self.config = config
-        self.tensorrt_context = TensorRTEngineCacheContext()
+        self.tensorrt_context = TensorRTEngineCacheContext(origin_model_patcher=model)
+        self.model_device = torch.device("cpu")
 
     def __call__(self, model_function, params):
         input_x = params.get("input")
@@ -253,6 +254,18 @@ class BlockTensorRTPatch:
         # disable with accelerate for now
         if hasattr(model_function.__self__, "hf_device_map"):
             return model_function(input_x, timestep_, **c)
+
+        if self.model_device.type != "cpu":
+            model_function.__self__.diffusion_model.input_blocks = (
+                model_function.__self__.diffusion_model.input_blocks.to(device="cpu")
+            )
+            model_function.__self__.diffusion_model.middle_block = (
+                model_function.__self__.diffusion_model.middle_block.to(device="cpu")
+            )
+            model_function.__self__.diffusion_model.output_blocks = (
+                model_function.__self__.diffusion_model.output_blocks.to(device="cpu")
+            )
+            self.model_device = torch.device("cpu")
 
         self.tensorrt_context.unet_config = (
             model_function.__self__.model_config.unet_config
@@ -270,13 +283,12 @@ class BlockTensorRTPatch:
 
     def to(self, device):
         if type(device) == torch.device:
-            for k, v in self.tensorrt_context.block_cache.items():
-                v.pytorch_model_device = device
-            if device.type == "cpu":
-                for k, v in self.tensorrt_context.block_cache.items():
-                    del v.engine_cache
-                    v.engine_cache = None
+            self.model_device = device
         return self
+
+
+def hook_memory_required(input_shape):
+    return 0
 
 
 class PatchType(enum.Enum):
@@ -292,6 +304,7 @@ class ApplyTensorRTUnet:
                 "model": ("MODEL",),
                 "enable_cuda_graph": ("BOOLEAN", {"default": True}),
                 "patch_type": ([e.name for e in PatchType], {"default": "UNET_BLOCK"}),
+                "hook_memory_require": ("BOOLEAN", {"default": True}),
             }
         }
 
@@ -300,7 +313,7 @@ class ApplyTensorRTUnet:
 
     CATEGORY = "loaders"
 
-    def apply_tensorrt(self, model, enable_cuda_graph, patch_type):
+    def apply_tensorrt(self, model, enable_cuda_graph, patch_type, hook_memory_require):
         config = TensorRTEngineConfig(enable_cuda_graph=enable_cuda_graph)
         patch = None
         for e in PatchType:
@@ -309,4 +322,6 @@ class ApplyTensorRTUnet:
         assert patch != None
         model_tensor_rt = model.clone()
         model_tensor_rt.set_model_unet_function_wrapper(patch)
+        if hook_memory_require:
+            model_tensor_rt.add_object_patch("memory_required", hook_memory_required)
         return (model_tensor_rt,)
