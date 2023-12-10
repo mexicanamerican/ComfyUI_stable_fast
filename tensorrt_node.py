@@ -1,21 +1,31 @@
 import enum
 import gc
 from io import BytesIO
+import copy
 
 import torch
 from torch.cuda import nvtx
 
 import comfy.model_management
+import comfy.model_patcher
+import nodes
 
 from .module.comfy_trace_utilities import BaseModelApplyModel
 from .module.openaimodel_tensorrt import (
     TENSORRT_CONTEXT_KEY,
-    TensorRTEngineCacheContext,
-    TensorRTEngineConfig,
+    TensorRTEngineBlockContext,
     do_hook_forward_timestep_embed,
+    undo_hook_forward_timestep_embed,
+)
+from .module.sd_tensorrt import (
+    CallableTensorRTEngineWarperDynamicShapeVAEDecode,
+    VAEDecodeModule,
+)
+from .module.tensorrt_warper import (
+    TensorRTEngineConfig,
+    TensorRTEngineContext,
     gen_engine,
     get_engine_with_cache,
-    undo_hook_forward_timestep_embed,
 )
 
 
@@ -186,7 +196,9 @@ class TensorRTPatch:
             nvtx.range_pop()
 
             if engine == None:
-                engine = gen_engine(key, self.onnx_buff.getvalue(), profile_shape_info)
+                engine = gen_engine(
+                    key, self.onnx_buff.getvalue(), [profile_shape_info], torch.float16
+                )
                 self.onnx_buff.seek(0)
                 engine.refit_simple(self.onnx_buff, reset_zero=True)
                 engine.save_engine()
@@ -240,11 +252,62 @@ class TensorRTPatch:
 
 
 class BlockTensorRTPatch:
+    tensorrt_context_cache = {}
+
     def __init__(self, model, config):
         self.model = model
         self.config = config
-        self.tensorrt_context = TensorRTEngineCacheContext(origin_model_patcher=model)
         self.model_device = torch.device("cpu")
+
+    def warmup(self, model_function, params):
+        input_x = params.get("input")
+        timestep_ = params.get("timestep")
+        c = params.get("c")
+
+        warmup_input_x = torch.zeros(
+            (
+                self.config.keep_batch_size * 2,
+                input_x.shape[1],
+                int(self.config.keep_height / 8),
+                int(self.config.keep_width / 8),
+            ),
+            device=input_x.device,
+            dtype=input_x.dtype,
+        )
+        warmup_timestep_ = torch.ones(
+            (self.config.keep_batch_size * 2,),
+            device=timestep_.device,
+            dtype=timestep_.dtype,
+        )
+        warmup_c = {"transformer_options": {}}
+        c_crossattn = c.get("c_crossattn", None)
+        if c_crossattn != None:
+            warmup_c["c_crossattn"] = torch.zeros(
+                (
+                    self.config.keep_batch_size * 2,
+                    self.config.keep_embedding_block * 77,
+                    c_crossattn.shape[2],
+                ),
+                device=c_crossattn.device,
+                dtype=c_crossattn.dtype,
+            )
+        c_concat = c.get("c_concat", None)
+        if c_concat != None:
+            warmup_c["c_concat"] = torch.zeros(
+                (
+                    self.config.keep_batch_size * 2,
+                    c_concat.shape[1],
+                    int(self.config.keep_height / 8),
+                    int(self.config.keep_width / 8),
+                ),
+                device=c_concat.device,
+                dtype=c_concat.dtype,
+            )
+
+        self(
+            model_function,
+            {"input": warmup_input_x, "timestep": warmup_timestep_, "c": warmup_c},
+        )
 
     def __call__(self, model_function, params):
         input_x = params.get("input")
@@ -255,29 +318,39 @@ class BlockTensorRTPatch:
         if hasattr(model_function.__self__, "hf_device_map"):
             return model_function(input_x, timestep_, **c)
 
-        if self.model_device.type != "cpu":
-            model_function.__self__.diffusion_model.input_blocks = (
-                model_function.__self__.diffusion_model.input_blocks.to(device="cpu")
+        if not id(self) in self.tensorrt_context_cache:
+            self.tensorrt_context_cache[id(self)] = TensorRTEngineBlockContext()
+            self.tensorrt_context_cache[id(self)].tensorrt_context.keep_models.append(
+                self.model
             )
-            model_function.__self__.diffusion_model.middle_block = (
-                model_function.__self__.diffusion_model.middle_block.to(device="cpu")
-            )
-            model_function.__self__.diffusion_model.output_blocks = (
-                model_function.__self__.diffusion_model.output_blocks.to(device="cpu")
-            )
-            self.model_device = torch.device("cpu")
+            self.warmup(model_function, params)
 
-        self.tensorrt_context.unet_config = (
+        self.tensorrt_context_cache[
+            id(self)
+        ].tensorrt_context.model_type = (
+            model_function.__self__.model_config.__class__.__name__
+        )
+        self.tensorrt_context_cache[
+            id(self)
+        ].tensorrt_context.unet_config = (
             model_function.__self__.model_config.unet_config
         )
-        self.tensorrt_context.cuda_stream = torch.cuda.current_stream()
-        c["transformer_options"][TENSORRT_CONTEXT_KEY] = self.tensorrt_context
+        self.tensorrt_context_cache[
+            id(self)
+        ].tensorrt_context.cuda_stream = torch.cuda.current_stream()
+        self.tensorrt_context_cache[
+            id(self)
+        ].tensorrt_context.cuda_device = input_x.device
+        c["transformer_options"][TENSORRT_CONTEXT_KEY] = self.tensorrt_context_cache[
+            id(self)
+        ]
 
         do_hook_forward_timestep_embed()
         try:
             out = model_function(input_x, timestep_, **c)
         finally:
             undo_hook_forward_timestep_embed()
+            c["transformer_options"].pop(TENSORRT_CONTEXT_KEY)
 
         return out
 
@@ -286,9 +359,51 @@ class BlockTensorRTPatch:
             self.model_device = device
         return self
 
+    def __del__(self):
+        if id(self) in self.tensorrt_context_cache:
+            self.tensorrt_context_cache.pop(id(self))
+
 
 def hook_memory_required(input_shape):
     return 0
+
+
+class TensorRTEngineOriginModelPatcherWarper_BlockPatch(
+    comfy.model_patcher.ModelPatcher
+):
+    @staticmethod
+    def cast_from(other):
+        tcls = comfy.model_patcher.ModelPatcher
+        if isinstance(other, tcls):
+            other.__class__ = TensorRTEngineOriginModelPatcherWarper_BlockPatch
+            return other
+        raise ValueError(f"instance must be {tcls.__qualname__}")
+
+    def cast_to_base_model(self):
+        self.__class__ = comfy.model_patcher.ModelPatcher
+        return self
+
+    def patch_model(self, device_to=None):
+        model = super().patch_model()
+
+        if device_to is not None:
+            for name, module in model.named_children():
+                if name in ("diffusion_model"):
+                    for name, module in module.named_children():
+                        if not name in (
+                            "input_blocks",
+                            "middle_block",
+                            "output_blocks",
+                        ):
+                            module.to(device_to)
+                else:
+                    module.to(device_to)
+            self.current_device = device_to
+
+        return model
+
+    def __del__(self):
+        self.model.to(self.current_device)
 
 
 class PatchType(enum.Enum):
@@ -305,6 +420,16 @@ class ApplyTensorRTUnet:
                 "enable_cuda_graph": ("BOOLEAN", {"default": True}),
                 "patch_type": ([e.name for e in PatchType], {"default": "UNET_BLOCK"}),
                 "hook_memory_require": ("BOOLEAN", {"default": True}),
+                "keep_width": (
+                    "INT",
+                    {"default": 768, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8},
+                ),
+                "keep_height": (
+                    "INT",
+                    {"default": 768, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8},
+                ),
+                "keep_batch_size": ("INT", {"default": 1, "min": 1, "max": 4096}),
+                "keep_embedding_block": ("INT", {"default": 2, "min": 1, "max": 4096}),
             }
         }
 
@@ -313,15 +438,134 @@ class ApplyTensorRTUnet:
 
     CATEGORY = "loaders"
 
-    def apply_tensorrt(self, model, enable_cuda_graph, patch_type, hook_memory_require):
-        config = TensorRTEngineConfig(enable_cuda_graph=enable_cuda_graph)
+    def apply_tensorrt(
+        self,
+        model,
+        enable_cuda_graph,
+        patch_type,
+        hook_memory_require,
+        keep_width,
+        keep_height,
+        keep_batch_size,
+        keep_embedding_block,
+    ):
+        config = TensorRTEngineConfig(
+            enable_cuda_graph=enable_cuda_graph,
+            keep_width=keep_width,
+            keep_height=keep_height,
+            keep_batch_size=keep_batch_size,
+            keep_embedding_block=keep_embedding_block,
+        )
         patch = None
         for e in PatchType:
             if e.name == patch_type:
                 patch = e.value(model, config)
         assert patch != None
         model_tensor_rt = model.clone()
+        if isinstance(patch, BlockTensorRTPatch):
+            model_tensor_rt = (
+                TensorRTEngineOriginModelPatcherWarper_BlockPatch.cast_from(
+                    model_tensor_rt
+                )
+            )
         model_tensor_rt.set_model_unet_function_wrapper(patch)
         if hook_memory_require:
             model_tensor_rt.add_object_patch("memory_required", hook_memory_required)
         return (model_tensor_rt,)
+
+
+class VAEDecodeTensorRTPatch:
+    def __init__(self, model, config):
+        self.model = model
+        self.org_decode = model.first_stage_model.decode
+        self.config = config
+        self.tensorrt_context = TensorRTEngineContext()
+        self.tensorrt_module = None
+
+    def warmup(self, samples_in):
+        warmup_samples = torch.zeros(
+            (
+                1,
+                samples_in.shape[1],
+                int(self.config.keep_height / 8),
+                int(self.config.keep_width / 8),
+            ),
+            device=samples_in.device,
+            dtype=samples_in.dtype,
+        )
+
+        self(warmup_samples)
+
+    def __call__(self, samples_in):
+        if self.tensorrt_module == None:
+            self.tensorrt_module = CallableTensorRTEngineWarperDynamicShapeVAEDecode(
+                self.tensorrt_context, ""
+            )
+            self.warmup(samples_in)
+
+        self.tensorrt_context.cuda_stream = torch.cuda.current_stream()
+        self.tensorrt_context.cuda_device = samples_in.device
+        self.tensorrt_context.dtype = samples_in.dtype
+
+        batch_number = 1
+        pixel_samples = torch.empty(
+            (
+                samples_in.shape[0],
+                3,
+                round(samples_in.shape[2] * 8),
+                round(samples_in.shape[3] * 8),
+            ),
+            device=samples_in.device,
+        )
+        for x in range(0, samples_in.shape[0], batch_number):
+            samples = samples_in[x : x + batch_number]
+            pixel_samples[x : x + batch_number] = self.tensorrt_module(
+                VAEDecodeModule(self.model.first_stage_model, self.org_decode),
+                samples=samples,
+            )
+        return pixel_samples
+
+
+class ApplyTensorRTVaeDecoder:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "vae": ("VAE",),
+                "enable_cuda_graph": ("BOOLEAN", {"default": False}),
+                "keep_width": (
+                    "INT",
+                    {"default": 768, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8},
+                ),
+                "keep_height": (
+                    "INT",
+                    {"default": 768, "min": 16, "max": nodes.MAX_RESOLUTION, "step": 8},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("VAE",)
+    FUNCTION = "apply_tensorrt"
+
+    CATEGORY = "loaders"
+
+    def apply_tensorrt(
+        self,
+        vae,
+        enable_cuda_graph,
+        keep_width,
+        keep_height,
+    ):
+        # hook comfy/sd.py#VAE.patcher
+        config = TensorRTEngineConfig(
+            enable_cuda_graph=enable_cuda_graph,
+            keep_width=keep_width,
+            keep_height=keep_height,
+        )
+        patch = VAEDecodeTensorRTPatch(vae, config)
+        vae_tensor_rt = copy.copy(vae)
+        vae_tensor_rt.patcher = vae_tensor_rt.patcher.clone()
+        vae_tensor_rt.patcher.add_object_patch("decode", patch)
+        return (vae_tensor_rt,)
+
+
