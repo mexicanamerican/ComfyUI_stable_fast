@@ -26,7 +26,7 @@ class TensorRTEngineConfig:
     keep_embedding_block: int = 2
 
 
-class CallableTensorRTEngineWarper:
+class CallableTensorRTEngineWrapper:
     def __init__(self, tensorrt_context, identification) -> None:
         self.tensorrt_context: TensorRTEngineContext = tensorrt_context
         self.identification = identification + self.__class__.__name__
@@ -36,7 +36,7 @@ class CallableTensorRTEngineWarper:
         self.input_shape_info = None
         self.input_profile_info = None
 
-        self.engine_comfy_model_patcher_warper = None
+        self.engine_comfy_model_patcher_wrapper = None
         self.device_memory_size = 0
 
         self.engine_cache_map = {}
@@ -51,6 +51,9 @@ class CallableTensorRTEngineWarper:
 
         return args, args_name, None
 
+    def gen_onnx_outputs(self, module):
+        return ["output"]
+
     def gen_tensorrt_args(self, kwargs):
         input_shape_info = {}
         feed_dict = {}
@@ -63,6 +66,9 @@ class CallableTensorRTEngineWarper:
 
     def gen_tensorrt_args_profile(self, input_shape_info):
         return {k: [v, v, v] for k, v in input_shape_info.items()}
+
+    def gen_tensorrt_outputs(self, output):
+        return output["output"]
 
     def is_profile_compatible(self, input_profile_info, input_shape_info):
         if input_profile_info == None:
@@ -98,7 +104,7 @@ class CallableTensorRTEngineWarper:
             if engine_cache_key in self.engine_cache_map:
                 (
                     self.engine,
-                    self.engine_comfy_model_patcher_warper,
+                    self.engine_comfy_model_patcher_wrapper,
                 ) = self.engine_cache_map[engine_cache_key]
                 self.input_profile_info = input_profile_info
             else:
@@ -119,7 +125,7 @@ class CallableTensorRTEngineWarper:
                             verbose=False,
                             do_constant_folding=True,
                             input_names=args_name,
-                            output_names=["output"],
+                            output_names=self.gen_onnx_outputs(module),
                             dynamic_axes=dynamic_axes,
                         )
                     except Exception as e:
@@ -133,6 +139,9 @@ class CallableTensorRTEngineWarper:
                 nvtx.range_pop()
 
                 if engine == None:
+                    comfy.model_management.free_memory(
+                        6 * 1024 * 1024 * 1024, self.tensorrt_context.cuda_device
+                    )
                     engine = gen_engine(
                         engine_cache_key,
                         self.onnx_cache.getvalue(),
@@ -153,8 +162,8 @@ class CallableTensorRTEngineWarper:
                     self.engine.load()
                     self.device_memory_size = self.engine.engine.device_memory_size
                     self.engine.unload()
-                    self.engine_comfy_model_patcher_warper = (
-                        TensorRTEngineComfyModelPatcherWarper(
+                    self.engine_comfy_model_patcher_wrapper = (
+                        TensorRTEngineComfyModelPatcherWrapper(
                             engine,
                             load_device=self.tensorrt_context.cuda_device,
                             offload_device="cpu",
@@ -164,7 +173,7 @@ class CallableTensorRTEngineWarper:
                     comfy.model_management.load_models_gpu(
                         [
                             *self.tensorrt_context.keep_models,
-                            self.engine_comfy_model_patcher_warper,
+                            self.engine_comfy_model_patcher_wrapper,
                         ],
                         self.device_memory_size,
                     )
@@ -175,7 +184,7 @@ class CallableTensorRTEngineWarper:
                     self.input_profile_info = input_profile_info
                     self.engine_cache_map[engine_cache_key] = (
                         self.engine,
-                        self.engine_comfy_model_patcher_warper,
+                        self.engine_comfy_model_patcher_wrapper,
                     )
                     nvtx.range_pop()
                 except Exception as e:
@@ -186,7 +195,7 @@ class CallableTensorRTEngineWarper:
             comfy.model_management.load_models_gpu(
                 [
                     *self.tensorrt_context.keep_models,
-                    self.engine_comfy_model_patcher_warper,
+                    self.engine_comfy_model_patcher_wrapper,
                 ],
                 self.device_memory_size,
             )
@@ -196,15 +205,14 @@ class CallableTensorRTEngineWarper:
             device=self.tensorrt_context.cuda_device,
             allocate_input_buffers=False,
         )
-        output = self.engine.infer(feed_dict, self.tensorrt_context.cuda_stream)[
-            "output"
-        ]
+        output = self.engine.infer(feed_dict, self.tensorrt_context.cuda_stream)
+        output = self.gen_tensorrt_outputs(output)
         self.engine.release_buffers()
 
         return output
 
 
-class TensorRTEngineComfyModelPatcherWarper(comfy.model_patcher.ModelPatcher):
+class TensorRTEngineComfyModelPatcherWrapper(comfy.model_patcher.ModelPatcher):
     def patch_model(self, device_to=None):
         if device_to is not None:
             self.model.load()

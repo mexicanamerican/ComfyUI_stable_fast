@@ -1,22 +1,10 @@
-import torch as th
-
 from .tensorrt_wrapper import CallableTensorRTEngineWrapper
 
 
-class VAEDecodeModule(th.nn.Module):
-    def __init__(self, module, decode):
-        super().__init__()
-        self.module = module
-        self.decode = decode
-
-    def forward(self, samples):
-        return self.decode(samples)
-
-
-class CallableTensorRTEngineWrapperDynamicShapeVAEDecode(CallableTensorRTEngineWrapper):
-    args_name = [
-        "samples",
-    ]
+class CallableTensorRTEngineWrapperDynamicShapeControlNet(
+    CallableTensorRTEngineWrapper
+):
+    args_name = ["x", "hint", "timesteps", "context", "y"]
 
     def gen_onnx_args(self, kwargs):
         args_name = []
@@ -26,7 +14,10 @@ class CallableTensorRTEngineWrapperDynamicShapeVAEDecode(CallableTensorRTEngineW
             if args[-1] != None:
                 args_name.append(arg_name)
         dynamic_axes = {
-            "samples": {2: "H", 3: "W"},
+            "x": {0: "B", 2: "H", 3: "W"},
+            "hint": {0: "HB", 2: "8H", 3: "8W"},
+            "timesteps": {0: "B"},
+            "context": {0: "B", 1: "77E"},
         }
         for k in list(dynamic_axes.keys()):
             if not k in args_name:
@@ -46,7 +37,10 @@ class CallableTensorRTEngineWrapperDynamicShapeVAEDecode(CallableTensorRTEngineW
 
     def gen_tensorrt_args_profile(self, input_shape_info):
         min_input_profile_info = {
-            "samples": {2: 2, 3: 2},
+            "x": {0: 1, 2: 8, 3: 8},
+            "hint": {0: 1, 2: 64, 3: 64},
+            "timesteps": {0: 1},
+            "context": {0: 1, 1: 77},
         }
         input_profile_info = {}
         for arg_name in self.args_name:
@@ -64,3 +58,16 @@ class CallableTensorRTEngineWrapperDynamicShapeVAEDecode(CallableTensorRTEngineW
                 ]
 
         return input_profile_info
+
+    def gen_onnx_outputs(self, module):
+        outputs_name = []
+        for i in range(len(module.input_blocks) + 1):
+            outputs_name.append(f"output_{i}")
+        self.outputs_name = outputs_name
+        return outputs_name
+
+    def gen_tensorrt_outputs(self, output_map):
+        output = []
+        for output_name in self.outputs_name:
+            output.append(output_map[output_name])
+        return output
