@@ -142,7 +142,7 @@ class TQDMProgressMonitor(trt.IProgressMonitor):
 
 
 class Engine:
-    def __init__(self, engine_path, enable_cuda_graph=True):
+    def __init__(self, engine_path, enable_cuda_graph=False):
         self.engine_path = engine_path
         self.engine = None
         self.context = None
@@ -281,9 +281,13 @@ class Engine:
             config_kwargs["tactic_sources"] = []
 
         if type(onnx_path) == bytes:
-            network = network_from_onnx_bytes(onnx_path)
+            network = network_from_onnx_bytes(
+                onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]
+            )
         else:
-            network = network_from_onnx_path(onnx_path)
+            network = network_from_onnx_path(
+                onnx_path, flags=[trt.OnnxParserFlag.NATIVE_INSTANCENORM]
+            )
         if update_output_names:
             print(f"Updating network outputs to {update_output_names}")
             network = ModifyNetworkOutputs(network, update_output_names)
@@ -350,6 +354,7 @@ class Engine:
             )
         except Exception as e:
             raise Exception(f"Failed to build engine: {e}")
+        self.update_binding_set()
 
     def save_engine(self):
         print(f"Saveing TensorRT engine: {self.engine_path}")
@@ -365,6 +370,9 @@ class Engine:
             print(f"Loading TensorRT engine: {self.engine_path}")
             with zstandard.open(self.engine_path, "rb") as zrfp:
                 self.engine = engine_from_bytes(zrfp.read())
+        self.update_binding_set()
+
+    def update_binding_set(self):
         self.binding_set = set()
         for idx in range(self.engine.num_io_tensors):
             self.binding_set.add(self.engine[idx])
@@ -376,7 +384,8 @@ class Engine:
         self.engine = None
 
     def offload(self):
-        self.refited_engine_byte = bytes_from_engine(self.engine)
+        if self.refited_engine_byte == None:
+            self.refited_engine_byte = bytes_from_engine(self.engine)
         self.unload()
         self.buffers = OrderedDict()
         self.tensors = OrderedDict()
