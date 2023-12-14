@@ -43,7 +43,7 @@ class CallableTensorRTEngineWrapper:
 
         self.engine_cache_map = {}
 
-    def gen_onnx_args(self, kwargs):
+    def gen_onnx_args(self, kwargs, module=None):
         args = []
         args_name = []
         for arg_name, arg in kwargs.items():
@@ -116,7 +116,9 @@ class CallableTensorRTEngineWrapper:
 
                 if self.onnx_cache == None:
                     module.to(device=self.tensorrt_context.cuda_device)
-                    args, args_name, dynamic_axes = self.gen_onnx_args(kwargs)
+                    args, args_name, dynamic_axes = self.gen_onnx_args(
+                        kwargs, module=module
+                    )
                     self.onnx_cache = BytesIO()
                     try:
                         th.onnx.export(
@@ -140,9 +142,12 @@ class CallableTensorRTEngineWrapper:
                 comfy.model_management.soft_empty_cache()
                 nvtx.range_pop()
 
+                additional_keep_models = []
                 if engine == None:
+                    additional_keep_models = get_additional_keep_models()
                     comfy.model_management.free_memory(
-                        6 * 1024 * 1024 * 1024, self.tensorrt_context.cuda_device
+                        6 * 1024 * 1024 * 1024,
+                        self.tensorrt_context.cuda_device,
                     )
                     engine = gen_engine(
                         engine_cache_key,
@@ -178,6 +183,7 @@ class CallableTensorRTEngineWrapper:
                             *self.tensorrt_context.keep_models,
                             self.engine_comfy_model_patcher_wrapper,
                             *get_additional_keep_models(),
+                            *additional_keep_models,
                         ],
                         self.device_memory_size,
                     )
