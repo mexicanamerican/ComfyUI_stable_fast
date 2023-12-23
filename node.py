@@ -1,5 +1,5 @@
 import torch
-from sfast.compilers.stable_diffusion_pipeline_compiler import CompilationConfig
+from sfast.compilers.diffusion_pipeline_compiler import CompilationConfig
 
 from .module.sfast_pipeline_compiler import build_lazy_trace_module
 
@@ -42,6 +42,9 @@ class StableFastPatch:
         self.model = model
         self.config = config
         self.stable_fast_model = None
+
+    def __deepcopy__(self, memo=None):
+        return self
 
     def __call__(self, model_function, params):
         input_x = params.get("input")
